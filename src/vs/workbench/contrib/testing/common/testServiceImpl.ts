@@ -27,13 +27,14 @@ import { TestingContextKeys } from 'vs/workbench/contrib/testing/common/testingC
 import { canUseProfileWithTest, ITestProfileService } from 'vs/workbench/contrib/testing/common/testProfileService';
 import { ITestResult } from 'vs/workbench/contrib/testing/common/testResult';
 import { ITestResultService } from 'vs/workbench/contrib/testing/common/testResultService';
-import { AmbiguousRunTestsRequest, IMainThreadTestController, ITestService } from 'vs/workbench/contrib/testing/common/testService';
-import { ResolvedTestRunRequest, TestDiffOpType, TestsDiff } from 'vs/workbench/contrib/testing/common/testTypes';
+import { AmbiguousRunTestsRequest, IMainThreadTestController, IMainThreadTestHostProxy, ITestFollowups, ITestService } from 'vs/workbench/contrib/testing/common/testService';
+import { ResolvedTestRunRequest, TestDiffOpType, TestMessageFollowupRequest, TestsDiff } from 'vs/workbench/contrib/testing/common/testTypes';
 import { IEditorService } from 'vs/workbench/services/editor/common/editorService';
 
 export class TestService extends Disposable implements ITestService {
 	declare readonly _serviceBrand: undefined;
 	private testControllers = new Map<string, IMainThreadTestController>();
+	private testExtHosts = new Set<IMainThreadTestHostProxy>();
 
 	private readonly cancelExtensionTestRunEmitter = new Emitter<{ runId: string | undefined }>();
 	private readonly willProcessDiffEmitter = new Emitter<TestsDiff>();
@@ -267,6 +268,32 @@ export class TestService extends Disposable implements ITestService {
 	/**
 	 * @inheritdoc
 	 */
+	public async provideTestFollowups(req: TestMessageFollowupRequest, token: CancellationToken): Promise<ITestFollowups> {
+		const reqs = await Promise.all([...this.testExtHosts].map(async ctrl =>
+			({ ctrl, followups: await ctrl.provideTestFollowups(req, token) })));
+
+		const followups: ITestFollowups = {
+			followups: reqs.flatMap(({ ctrl, followups }) => followups.map(f => ({
+				message: f.title,
+				execute: () => ctrl.executeTestFollowup(f.id)
+			}))),
+			dispose: () => {
+				for (const { ctrl, followups } of reqs) {
+					ctrl.disposeTestFollowups(followups.map(f => f.id));
+				}
+			}
+		};
+
+		if (token.isCancellationRequested) {
+			followups.dispose();
+		}
+
+		return followups;
+	}
+
+	/**
+	 * @inheritdoc
+	 */
 	public publishDiff(_controllerId: string, diff: TestsDiff) {
 		this.willProcessDiffEmitter.fire(diff);
 		this.collection.apply(diff);
@@ -328,6 +355,14 @@ export class TestService extends Disposable implements ITestService {
 	/**
 	 * @inheritdoc
 	 */
+	registerExtHost(controller: IMainThreadTestHostProxy): IDisposable {
+		this.testExtHosts.add(controller);
+		return toDisposable(() => this.testExtHosts.delete(controller));
+	}
+
+	/**
+	 * @inheritdoc
+	 */
 	public registerTestController(id: string, controller: IMainThreadTestController): IDisposable {
 		this.testControllers.set(id, controller);
 		this.providerCount.set(this.testControllers.size);
@@ -366,7 +401,7 @@ export class TestService extends Disposable implements ITestService {
 	}
 
 	private async saveAllBeforeTest(req: ResolvedTestRunRequest, configurationService: IConfigurationService = this.configurationService, editorService: IEditorService = this.editorService): Promise<void> {
-		if (req.isUiTriggered === false) {
+		if (req.preserveFocus === true) {
 			return;
 		}
 		const saveBeforeTest = getTestingConfiguration(this.configurationService, TestingConfigKeys.SaveBeforeTest);

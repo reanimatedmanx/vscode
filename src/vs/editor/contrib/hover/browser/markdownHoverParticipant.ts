@@ -5,7 +5,7 @@
 
 import * as dom from 'vs/base/browser/dom';
 import { asArray, compareBy, numberComparator } from 'vs/base/common/arrays';
-import { CancellationToken } from 'vs/base/common/cancellation';
+import { CancellationToken, CancellationTokenSource } from 'vs/base/common/cancellation';
 import { IMarkdownString, isEmptyMarkdownString, MarkdownString } from 'vs/base/common/htmlContent';
 import { Disposable, DisposableStore, IDisposable, toDisposable } from 'vs/base/common/lifecycle';
 import { MarkdownRenderer } from 'vs/editor/browser/widget/markdownRenderer/browser/markdownRenderer';
@@ -26,11 +26,10 @@ import { registerIcon } from 'vs/platform/theme/common/iconRegistry';
 import { Codicon } from 'vs/base/common/codicons';
 import { ThemeIcon } from 'vs/base/common/themables';
 import { onUnexpectedExternalError } from 'vs/base/common/errors';
-import { getDefaultHoverDelegate } from 'vs/base/browser/ui/hover/hoverDelegateFactory';
 import { IKeybindingService } from 'vs/platform/keybinding/common/keybinding';
-import { ClickAction, KeyDownAction } from 'vs/base/browser/ui/hover/hoverWidget';
+import { ClickAction, HoverPosition, KeyDownAction } from 'vs/base/browser/ui/hover/hoverWidget';
 import { KeyCode } from 'vs/base/common/keyCodes';
-import { IHoverService } from 'vs/platform/hover/browser/hover';
+import { IHoverService, WorkbenchHoverDelegate } from 'vs/platform/hover/browser/hover';
 import { AsyncIterableObject } from 'vs/base/common/async';
 import { LanguageFeatureRegistry } from 'vs/editor/common/languageFeatureRegistry';
 import { getHoverProviderResultsAsAsyncIterable } from 'vs/editor/contrib/hover/browser/getHover';
@@ -186,6 +185,7 @@ export class MarkdownHoverParticipant implements IEditorHoverParticipant<Markdow
 			this._openerService,
 			this._keybindingService,
 			this._hoverService,
+			this._configurationService,
 			context.onContentsChanged
 		);
 		return this._renderedHoverParts;
@@ -212,6 +212,7 @@ class MarkdownRenderedHoverParts extends Disposable {
 
 	private _renderedHoverParts: RenderedHoverPart[];
 	private _hoverFocusInfo: FocusedHoverInfo = { hoverPartIndex: -1, focusRemains: false };
+	private _ongoingHoverOperations: Map<HoverProvider, { verbosityDelta: number; tokenSource: CancellationTokenSource }> = new Map();
 
 	constructor(
 		hoverParts: MarkdownHover[], // we own!
@@ -221,6 +222,7 @@ class MarkdownRenderedHoverParts extends Disposable {
 		private readonly _openerService: IOpenerService,
 		private readonly _keybindingService: IKeybindingService,
 		private readonly _hoverService: IHoverService,
+		private readonly _configurationService: IConfigurationService,
 		private readonly _onFinishedRendering: () => void,
 	) {
 		super();
@@ -229,6 +231,9 @@ class MarkdownRenderedHoverParts extends Disposable {
 			this._renderedHoverParts.forEach(renderedHoverPart => {
 				renderedHoverPart.disposables.dispose();
 			});
+		}));
+		this._register(toDisposable(() => {
+			this._ongoingHoverOperations.forEach(operation => { operation.tokenSource.dispose(true); });
 		}));
 	}
 
@@ -317,14 +322,15 @@ class MarkdownRenderedHoverParts extends Disposable {
 		const isActionIncrease = action === HoverVerbosityAction.Increase;
 		const actionElement = dom.append(container, $(ThemeIcon.asCSSSelector(isActionIncrease ? increaseHoverVerbosityIcon : decreaseHoverVerbosityIcon)));
 		actionElement.tabIndex = 0;
+		const hoverDelegate = new WorkbenchHoverDelegate('mouse', false, { target: container, position: { hoverPosition: HoverPosition.LEFT } }, this._configurationService, this._hoverService);
 		if (isActionIncrease) {
 			const kb = this._keybindingService.lookupKeybinding(INCREASE_HOVER_VERBOSITY_ACTION_ID);
-			store.add(this._hoverService.setupUpdatableHover(getDefaultHoverDelegate('mouse'), actionElement, kb ?
+			store.add(this._hoverService.setupUpdatableHover(hoverDelegate, actionElement, kb ?
 				nls.localize('increaseVerbosityWithKb', "Increase Verbosity ({0})", kb.getLabel()) :
 				nls.localize('increaseVerbosity', "Increase Verbosity")));
 		} else {
 			const kb = this._keybindingService.lookupKeybinding(DECREASE_HOVER_VERBOSITY_ACTION_ID);
-			store.add(this._hoverService.setupUpdatableHover(getDefaultHoverDelegate('mouse'), actionElement, kb ?
+			store.add(this._hoverService.setupUpdatableHover(hoverDelegate, actionElement, kb ?
 				nls.localize('decreaseVerbosityWithKb', "Decrease Verbosity ({0})", kb.getLabel()) :
 				nls.localize('decreaseVerbosity', "Decrease Verbosity")));
 		}
@@ -349,31 +355,43 @@ class MarkdownRenderedHoverParts extends Disposable {
 		if (!hoverRenderedPart || !hoverRenderedPart.hoverSource?.supportsVerbosityAction(action)) {
 			return;
 		}
-		const hoverPosition = hoverRenderedPart.hoverSource.hoverPosition;
-		const hoverProvider = hoverRenderedPart.hoverSource.hoverProvider;
-		const hover = hoverRenderedPart.hoverSource.hover;
-		const hoverContext: HoverContext = { action, previousHover: hover };
-
-		let newHover: Hover | null | undefined;
-		try {
-			newHover = await Promise.resolve(hoverProvider.provideHover(model, hoverPosition, CancellationToken.None, hoverContext));
-		} catch (e) {
-			onUnexpectedExternalError(e);
-		}
+		const hoverSource = hoverRenderedPart.hoverSource;
+		const newHover = await this._fetchHover(hoverSource, model, action);
 		if (!newHover) {
 			return;
 		}
-
-		const hoverSource = new HoverSource(newHover, hoverProvider, hoverPosition);
-		const renderedHoverPart = this._renderHoverPart(
+		const newHoverSource = new HoverSource(newHover, hoverSource.hoverProvider, hoverSource.hoverPosition);
+		const newHoverRenderedPart = this._renderHoverPart(
 			hoverFocusedPartIndex,
 			newHover.contents,
-			hoverSource,
+			newHoverSource,
 			this._onFinishedRendering
 		);
-		this._replaceRenderedHoverPartAtIndex(hoverFocusedPartIndex, renderedHoverPart);
+		this._replaceRenderedHoverPartAtIndex(hoverFocusedPartIndex, newHoverRenderedPart);
 		this._focusOnHoverPartWithIndex(hoverFocusedPartIndex);
 		this._onFinishedRendering();
+	}
+
+	private async _fetchHover(hoverSource: HoverSource, model: ITextModel, action: HoverVerbosityAction): Promise<Hover | null | undefined> {
+		let verbosityDelta = action === HoverVerbosityAction.Increase ? 1 : -1;
+		const provider = hoverSource.hoverProvider;
+		const ongoingHoverOperation = this._ongoingHoverOperations.get(provider);
+		if (ongoingHoverOperation) {
+			ongoingHoverOperation.tokenSource.cancel();
+			verbosityDelta += ongoingHoverOperation.verbosityDelta;
+		}
+		const tokenSource = new CancellationTokenSource();
+		this._ongoingHoverOperations.set(provider, { verbosityDelta, tokenSource });
+		const context: HoverContext = { verbosityRequest: { verbosityDelta, previousHover: hoverSource.hover } };
+		let hover: Hover | null | undefined;
+		try {
+			hover = await Promise.resolve(provider.provideHover(model, hoverSource.hoverPosition, tokenSource.token, context));
+		} catch (e) {
+			onUnexpectedExternalError(e);
+		}
+		tokenSource.dispose();
+		this._ongoingHoverOperations.delete(provider);
+		return hover;
 	}
 
 	private _replaceRenderedHoverPartAtIndex(index: number, renderedHoverPart: RenderedHoverPart): void {
